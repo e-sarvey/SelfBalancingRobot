@@ -12,20 +12,27 @@ float dt, tt, tt_last;
 float mqttGyroX, mqttGyroY, mqttGyroZ; // For MQTT task
 float loopFrequency = 0;
 // Motor control variables
+const int pwmResolution = 16; 
 int in1 = 19;
 int in2 = 18;
 int in3 = 4;
 int in4 = 2;
 int duty_cycle = 0;
 float error = 0;
-float max_PWM_angle = 40;
-float min_PWM = 50;
+float max_PWM_angle = 50;
+int max_pwm = pow(2,pwmResolution);
+int min_PWM = 0.2*max_pwm; // this might need to be rounded
 float Kp = 1.0;    // Initial value for Kp
-float Kp0 = (255-min_PWM)/max_PWM_angle; // normalization value for max PWM at 45 degrees
+float Kp0 = (max_pwm-min_PWM)/max_PWM_angle; // normalization value for max PWM at 45 degrees
 float Kd = 0;     // Initial value for Kd
 float anglex = 0;
 float roll = 0;  // Rotation about x-axis
-
+// PWM-related definitions
+const int pwmFreq = 1000;       // PWM frequency in Hz   
+const int pwmChannel1_forward = 0;  // PWM channel for motor 1 forward
+const int pwmChannel1_reverse = 1;  // PWM channel for motor 1 reverse
+const int pwmChannel2_forward = 2;  // PWM channel for motor 2 forward
+const int pwmChannel2_reverse = 3;  // PWM channel for motor 2 reverse
 // Timing variables
 unsigned long lastMQTTTransmission = 0;
 
@@ -38,7 +45,7 @@ const int mqtt_port = 1883;               // MQTT Broker Port
 // Task settings
 const int mqttTaskDelayMs = 20;           // MQTT task delay in milliseconds (50Hz)
 const int i2cTaskDelayMs = 0.1;           // I2C task delay in milliseconds
-const int mqttPublishIntervalMs = 10;     // MQTT data publishing interval (1 second)
+const int mqttPublishIntervalMs = 100;     // MQTT data publishing interval (1 second)
 
 // OLED display settings
 #define SCREEN_WIDTH 128
@@ -59,7 +66,7 @@ struct BalancingGains {
   bool newGainsAvailable;
 };
 
-BalancingGains gains = {1.0, 0.0, false};  // Initialize gains with Kp = 20 and Kd = 0
+BalancingGains gains = {0.6, 0.0, false};  // Initialize gains with Kp = 20 and Kd = 0
 SemaphoreHandle_t gainsMutex;  // Mutex to protect shared data
 
 // Gyro range options (in degrees per second)
@@ -153,24 +160,26 @@ void reconnect() {
   }
 }
 
-// Motor control functions
-void motor1(int duty_cycle) {
-  if (duty_cycle < 0) {
-    analogWrite(in1, abs(duty_cycle));
-    analogWrite(in2, 0);
+// Motor control functions using PWM
+void motor1(float anglex, int duty_cycle) {
+  int pwmValue = abs(duty_cycle);  // Ensure duty cycle is positive for PWM
+  if (anglex > 180.0) {
+    ledcWrite(pwmChannel1_forward, pwmValue);  // Forward direction
+    ledcWrite(pwmChannel1_reverse, 0);         // No reverse
   } else {
-    analogWrite(in1, 0);
-    analogWrite(in2, abs(duty_cycle));
+    ledcWrite(pwmChannel1_forward, 0);         // No forward
+    ledcWrite(pwmChannel1_reverse, pwmValue);  // Reverse direction
   }
 }
 
-void motor2(int duty_cycle) {
-  if (duty_cycle < 0) {
-    analogWrite(in3, abs(duty_cycle));
-    analogWrite(in4, 0);
+void motor2(float anglex, int duty_cycle) {
+  int pwmValue = abs(duty_cycle);  // Ensure duty cycle is positive for PWM
+  if (anglex > 180.0) {
+    ledcWrite(pwmChannel2_forward, pwmValue);  // Forward direction
+    ledcWrite(pwmChannel2_reverse, 0);         // No reverse
   } else {
-    analogWrite(in3, 0);
-    analogWrite(in4, abs(duty_cycle));
+    ledcWrite(pwmChannel2_forward, 0);         // No forward
+    ledcWrite(pwmChannel2_reverse, pwmValue);  // Reverse direction
   }
 }
 
@@ -193,9 +202,8 @@ void updateOLEDDisplay() {
     display.print("Kp: ");
     display.println(gains.Kp, 2);  // Display Kp with 2 decimal places
 
-       // Move to the next line for Kd
+    // Move to the next line for Kd
     display.print("Kd: ");
-    
     display.print(gains.Kd, 2);  // Display Kd with 2 decimal places
     
     display.display();  // Push everything to the OLED screen
@@ -256,14 +264,20 @@ void MQTTTaskCode(void *pvParameters) {
     if (now - lastPublishTime > mqttPublishIntervalMs) {
       lastPublishTime = now;
 
-      // Create a JSON payload with angle estimate, gyro data, and PWM
-      char msg[200];
-      snprintf(msg, 200,
-        "{\"anglex\": %.2f, \"gyroX\": %.2f, \"gyroY\": %.2f, \"gyroZ\": %.2f, \"PWM\": %d}",
-        anglex, mqttGyroX, mqttGyroY, mqttGyroZ, duty_cycle);
+      // Take mutex to read current gains safely
+      if (xSemaphoreTake(gainsMutex, portMAX_DELAY)) {
+        // Create a JSON payload with angle estimate, gyro data, PWM, and current gains
+        char msg[250];
+        snprintf(msg, 250,
+          "{\"anglex\": %.2f, \"gyroX\": %.2f, \"gyroY\": %.2f, \"gyroZ\": %.2f, \"PWM\": %d, \"Kp\": %.2f, \"Kd\": %.2f}",
+          anglex, mqttGyroX, mqttGyroY, mqttGyroZ, duty_cycle, gains.Kp, gains.Kd);
 
-      // Publish the message to the "ESP32/data" topic
-      client.publish("ESP32/data", msg);
+        // Publish the message to the "ESP32/data" topic
+        client.publish("ESP32/data", msg);
+
+        // Release the mutex after reading gains
+        xSemaphoreGive(gainsMutex);
+      }
     }
 
     vTaskDelay(1);  // Yield to other tasks
@@ -271,7 +285,6 @@ void MQTTTaskCode(void *pvParameters) {
 }
 
 // Task for reading IMU data and controlling motors, pinned to core 1
-// Global variable to store frequency
 void i2cTask(void *pvParameters) {
   while (true) {
     tt = millis();
@@ -287,8 +300,8 @@ void i2cTask(void *pvParameters) {
     int16_t rawGyroY = (int16_t)(Wire.read() << 8 | Wire.read());
     int16_t rawGyroZ = (int16_t)(Wire.read() << 8 | Wire.read());
 
-    GyroX = rawGyroX / 131.0;
-    GyroY = rawGyroY / 131.0;
+    GyroY = rawGyroX / 131.0;
+    GyroX = rawGyroY / 131.0;
     GyroZ = rawGyroZ / 131.0;
 
     // Calculate roll (angle about x-axis) from accelerometer
@@ -297,8 +310,8 @@ void i2cTask(void *pvParameters) {
     Wire.endTransmission(false);
     Wire.requestFrom(MPU, 6);
 
-    int16_t rawAccX = (int16_t)(Wire.read() << 8 | Wire.read());
     int16_t rawAccY = (int16_t)(Wire.read() << 8 | Wire.read());
+    int16_t rawAccX = (int16_t)(Wire.read() << 8 | Wire.read());
     int16_t rawAccZ = (int16_t)(Wire.read() << 8 | Wire.read());
 
     float AccX = rawAccX / 16384.0;
@@ -310,15 +323,22 @@ void i2cTask(void *pvParameters) {
     roll = roll * (180 / PI);
 
     // Angle estimation using complementary filter
-    anglex = 0.02 * (anglex - gyroanglex) + 0.98 * roll;
-
+    anglex = (0.8 * (anglex - gyroanglex) + 0.2 * roll);
     // Control logic
-    error = 180 - anglex;
-    duty_cycle = 40 + (Kp*Kp0 * error) + (Kd * (-GyroX));
+    error = abs(180 - anglex);
+    // Motor control logic in i2cTask
+    duty_cycle = min_PWM + (gains.Kp * Kp0 * error) - (gains.Kd * abs(GyroX));
 
+    // duty cycle saturation
+    if (duty_cycle > max_pwm) {
+      duty_cycle = max_pwm;
+    }
+    if (duty_cycle < -max_pwm) {
+      duty_cycle = -max_pwm;
+    }
     // Motor control
-    motor1(duty_cycle);
-    motor2(duty_cycle);
+    motor1(anglex, duty_cycle);
+    motor2(anglex, duty_cycle);
 
     // Update shared values for MQTT
     mqttGyroX = GyroX;
@@ -326,31 +346,33 @@ void i2cTask(void *pvParameters) {
     mqttGyroZ = GyroZ;
 
     // Calculate and print loop frequency
-    
     loopFrequency = 1000.0 / dt;  // Convert period (ms) to frequency (Hz)
-    Serial.print("Loop frequency: ");
-    Serial.print(loopFrequency);
-    Serial.println(" Hz");
-    
+    // Serial.print("Loop frequency: ");
+    // Serial.print(loopFrequency);
+    // Serial.println(" Hz" );
 
     tt_last = tt;
     GyroX_last = GyroX;
-
-    //vTaskDelay(i2cTaskDelayMs);  // Yield to other tasks
   }
 }
-
 
 void setup() {
   Serial.begin(115200);
   Wire.begin();
   Wire.setClock(400000);  // Set I2C clock to 400 kHz for faster communication
 
-  // Initialize motor control pins
-  pinMode(in1, OUTPUT);
-  pinMode(in2, OUTPUT);
-  pinMode(in3, OUTPUT);
-  pinMode(in4, OUTPUT);
+  // Initialize motor control pins for PWM
+  ledcSetup(pwmChannel1_forward, pwmFreq, pwmResolution);
+  ledcAttachPin(in1, pwmChannel1_forward);  // PWM for motor 1 forward
+
+  ledcSetup(pwmChannel1_reverse, pwmFreq, pwmResolution);
+  ledcAttachPin(in2, pwmChannel1_reverse);  // PWM for motor 1 reverse
+
+  ledcSetup(pwmChannel2_forward, pwmFreq, pwmResolution);
+  ledcAttachPin(in3, pwmChannel2_forward);  // PWM for motor 2 forward
+
+  ledcSetup(pwmChannel2_reverse, pwmFreq, pwmResolution);
+  ledcAttachPin(in4, pwmChannel2_reverse);  // PWM for motor 2 reverse
 
   // Initialize WiFi and MQTT
   setup_wifi();
@@ -365,34 +387,35 @@ void setup() {
   display.clearDisplay();  // Clear the display buffer
   display.display();
   display.setTextColor(WHITE);
+
   // Initialize the mutex
   gainsMutex = xSemaphoreCreateMutex();
 
   // Display the initial gains on the OLED at startup
   updateOLEDDisplay();
-
-  // Start the MQTT task with lower priority and pin it to core 0
-  xTaskCreatePinnedToCore(MQTTTaskCode, "MQTT Task", 10000, NULL, 1, &MQTTTask, 0);
-
-  // Start the I2C communication (main loop) task on core 1
-  xTaskCreatePinnedToCore(i2cTask, "I2C Task", 10000, NULL, 2, NULL, 1);
+  Serial.println("OLED Configured");
 
   // Initialize the MPU6050
   Wire.beginTransmission(MPU);
   Wire.write(0x6B);
   Wire.write(0x00);  // Wake up MPU6050
   Wire.endTransmission(true);
+  delay(1000);
+  Serial.println("Configuring MPU6050");
 
-  // Configure Gyro Range
-  setGyroRange(MPU6050_RANGE_1000_DEG);  // Set to ±1000 dps (default)
-
-  // Configure Accelerometer Range
-  setAccelRange(MPU6050_RANGE_2_G);  // Set to ±2g (default)
-
-  // Configure Digital Low-Pass Filter
-  setDLPF(MPU6050_BAND_94_HZ);  // Set to 94 Hz bandwidth (default)
+  // Configure Gyro Range, Accelerometer Range, and Digital Low-Pass Filter
+  setGyroRange(MPU6050_RANGE_1000_DEG);
+  setAccelRange(MPU6050_RANGE_2_G);
+  setDLPF(MPU6050_BAND_94_HZ);
 
   Serial.println("MPU6050 configured.");
+
+  // Start the MQTT task with lower priority and pin it to core 0
+  xTaskCreatePinnedToCore(MQTTTaskCode, "MQTT Task", 10000, NULL, 1, &MQTTTask, 0);
+
+  // Start the I2C communication (main loop) task on core 1
+  xTaskCreatePinnedToCore(i2cTask, "I2C Task", 10000, NULL, 2, NULL, 1);
+  Serial.println("Threads Established");
 }
 
 void loop() {
