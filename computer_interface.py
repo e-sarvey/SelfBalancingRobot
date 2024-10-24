@@ -1,3 +1,4 @@
+# Updated to dynamically adjust y-axis limits for all plots based on data in the buffer
 import dearpygui.dearpygui as dpg
 import numpy as np
 import time
@@ -10,11 +11,11 @@ import threading
 # ---------------------------
 
 WINDOW_WIDTH = 800
-WINDOW_HEIGHT = 800
+WINDOW_HEIGHT = 600
 PLOT_WIDTH = 350
 PLOT_HEIGHT = 200
 SLIDER_WIDTH = 200
-SPACING_BETWEEN_GROUPS = 30  # Spacing between sets of sliders
+BUFFER_SIZE = 1000  # Size of the data buffer
 
 # MQTT Configurations
 MQTT_BROKER = "10.243.82.33"
@@ -23,26 +24,45 @@ GAINS_TOPIC = "ESP32/gains"
 
 # Data buffers for angle, gyro, PWM, and corresponding time buffer
 data_buffer = {
-    'anglex': np.zeros(1000),  # Buffer for anglex
-    'gyroX': np.zeros(1000),   # Buffer for GyroX
-    'pwm': np.zeros(1000)      # Buffer for PWM
+    'anglex': np.zeros(BUFFER_SIZE),  # Buffer for anglex
+    'gyroX': np.zeros(BUFFER_SIZE),   # Buffer for GyroX
+    'pwm': np.zeros(BUFFER_SIZE)      # Buffer for PWM
 }
-time_buffer = np.zeros(1000)  # Buffer to store time data for x-axis
+time_buffer = np.zeros(BUFFER_SIZE)  # Buffer to store time data for x-axis
+buffer_index = 0  # Index to manage the buffer
 
 # Gains variables and timers
-balancing_gains = {"Kp": 0.0, "Kd": 0.0, "Ki": 0.0}
-following_gains = {"Kp2": 0.0, "Kd2": 0.0, "Ki2": 0.0}
+balancing_gains = {"Kp": 0.0, "Kd": 0.0}
 last_change_time = time.time()  # Initialize the last change time
 gains_pending = False  # Flag to track if a change occurred and needs to be published
 start_time = time.time()
+
 # MQTT Setup
 client = mqtt.Client()
-client.connect(MQTT_BROKER)
-client.loop_start()
 
 # ---------------------------
 # Helper Functions
 # ---------------------------
+
+# MQTT callback to process incoming messages from ESP32/data
+def on_message(client, userdata, message):
+    global buffer_index
+    try:
+        # Parse the incoming JSON data
+        data = json.loads(message.payload.decode())
+        print(f"Received Data: {data}")  # Debugging print to verify incoming data
+
+        # Update data buffers
+        time_buffer[buffer_index] = time.time() - start_time
+        data_buffer['anglex'][buffer_index] = data.get('anglex', 0)
+        data_buffer['gyroX'][buffer_index] = data.get('gyroX', 0)
+        data_buffer['pwm'][buffer_index] = data.get('PWM', 0)
+
+        # Increment buffer index and wrap around if it exceeds buffer size
+        buffer_index = (buffer_index + 1) % BUFFER_SIZE
+
+    except json.JSONDecodeError as e:
+        print(f"Error decoding JSON: {e}")
 
 # Function to handle publishing the new gains if there are no changes for 2 seconds
 def publish_gains_if_stable():
@@ -51,8 +71,7 @@ def publish_gains_if_stable():
         if gains_pending and (time.time() - last_change_time >= 2):
             # Format the JSON payload with gains rounded to 3 decimal places
             payload = json.dumps({
-                "balancing": f"[{balancing_gains['Kp']:.3f},{balancing_gains['Kd']:.3f},{balancing_gains['Ki']:.3f}]",
-                "following": f"[{following_gains['Kp2']:.3f},{following_gains['Kd2']:.3f},{following_gains['Ki2']:.3f}]"
+                "balancing": f"[{balancing_gains['Kp']:.3f},{balancing_gains['Kd']:.3f}]"
             })
             # Publish the gains to the ESP32/gains topic
             client.publish(GAINS_TOPIC, payload)
@@ -86,49 +105,14 @@ def update_kd(sender, app_data):
 def update_kd_slider(sender, app_data):
     update_kd(sender, app_data)
 
-def update_ki(sender, app_data):
-    global last_change_time, gains_pending
-    balancing_gains["Ki"] = app_data
-    dpg.set_value("ki_label", f"Ki: {app_data:.3f}")
-    dpg.set_value("ki_slider", app_data)
-    last_change_time = time.time()
-    gains_pending = True
+# ---------------------------
+# MQTT Setup and Start
+# ---------------------------
 
-def update_ki_slider(sender, app_data):
-    update_ki(sender, app_data)
-
-def update_kp2(sender, app_data):
-    global last_change_time, gains_pending
-    following_gains["Kp2"] = app_data
-    dpg.set_value("kp2_label", f"Kp2: {app_data:.3f}")
-    dpg.set_value("kp2_slider", app_data)
-    last_change_time = time.time()
-    gains_pending = True
-
-def update_kp2_slider(sender, app_data):
-    update_kp2(sender, app_data)
-
-def update_kd2(sender, app_data):
-    global last_change_time, gains_pending
-    following_gains["Kd2"] = app_data
-    dpg.set_value("kd2_label", f"Kd2: {app_data:.3f}")
-    dpg.set_value("kd2_slider", app_data)
-    last_change_time = time.time()
-    gains_pending = True
-
-def update_kd2_slider(sender, app_data):
-    update_kd2(sender, app_data)
-
-def update_ki2(sender, app_data):
-    global last_change_time, gains_pending
-    following_gains["Ki2"] = app_data
-    dpg.set_value("ki2_label", f"Ki2: {app_data:.3f}")
-    dpg.set_value("ki2_slider", app_data)
-    last_change_time = time.time()
-    gains_pending = True
-
-def update_ki2_slider(sender, app_data):
-    update_ki2(sender, app_data)
+client.on_message = on_message  # Set the callback function for message reception
+client.connect(MQTT_BROKER)
+client.subscribe(DATA_TOPIC)  # Subscribe to the ESP32/data topic
+client.loop_start()  # Start the MQTT loop in a separate thread
 
 # ---------------------------
 # GUI Setup
@@ -152,78 +136,41 @@ with dpg.theme(tag="pwm_theme"):
 
 # Main GUI layout
 with dpg.window(label="Robot Data Viewer", width=WINDOW_WIDTH, height=WINDOW_HEIGHT):
-    with dpg.group(horizontal=False):  # Group the content vertically
-    
-        # 2x2 Grid of plots
-        with dpg.group(horizontal=True):
-            # Group for top two plots (angle and angular velocity)
-            with dpg.group():
-                # Angle Plot
-                with dpg.plot(label="Angle Plot", height=PLOT_HEIGHT, width=PLOT_WIDTH):
-                    dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag="xaxis_angle")
-                    y_axis = dpg.add_plot_axis(dpg.mvYAxis, label="Angle")
-                    angle_series = dpg.add_line_series(time_buffer, data_buffer['anglex'], label="Angle Data", parent=y_axis)
-                    dpg.bind_item_theme(angle_series, "angle_theme")
-                
-                # Angular Velocity Plot with GyroX
-                with dpg.plot(label="Angular Velocity Plot", height=PLOT_HEIGHT, width=PLOT_WIDTH):
-                    x_axis = dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag="xaxis_gyro")
-                    y_axis = dpg.add_plot_axis(dpg.mvYAxis, label="GyroX", tag="yaxis_gyro")
-                    dpg.set_axis_limits(y_axis, 0, 600)  # Scale y-axis from 0 to 600 rad/s
-                    
-                    gyro_x_series = dpg.add_line_series(time_buffer, data_buffer['gyroX'], label="GyroX", parent=y_axis)
-                    dpg.bind_item_theme(gyro_x_series, "gyro_x_theme")
+    # First Row: Angle Plot (left) and PWM Plot (right)
+    with dpg.group(horizontal=True):
+        # Angle Plot (Top Left)
+        with dpg.plot(label="Angle Plot", height=PLOT_HEIGHT, width=PLOT_WIDTH):
+            dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag="xaxis_angle")
+            y_axis = dpg.add_plot_axis(dpg.mvYAxis, label="Angle", tag="yaxis_angle")
+            angle_series = dpg.add_line_series(time_buffer, data_buffer['anglex'], label="Angle Data", parent=y_axis)
+            dpg.bind_item_theme(angle_series, "angle_theme")
+        
+        # PWM Plot (Top Right)
+        with dpg.plot(label="PWM Plot", height=PLOT_HEIGHT, width=PLOT_WIDTH):
+            dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag="xaxis_pwm")
+            y_axis = dpg.add_plot_axis(dpg.mvYAxis, label="PWM", tag="yaxis_pwm")
+            pwm_series = dpg.add_line_series(time_buffer, data_buffer['pwm'], label="PWM Data", parent=y_axis)
+            dpg.bind_item_theme(pwm_series, "pwm_theme")
 
-            # Group for bottom two plots (displacement and PWM)
-            with dpg.group():
-                # Displacement Plot (Placeholder)
-                with dpg.plot(label="Displacement Plot", height=PLOT_HEIGHT, width=PLOT_WIDTH):
-                    dpg.add_plot_axis(dpg.mvXAxis, label="X Axis")
-                    y_axis = dpg.add_plot_axis(dpg.mvYAxis, label="Displacement")
-                    dpg.add_line_series(np.linspace(0, 10, 100), np.tan(np.linspace(0, 10, 100)), label="Displacement Data", parent=y_axis)
-                
-                # PWM Plot
-                with dpg.plot(label="PWM Plot", height=PLOT_HEIGHT, width=PLOT_WIDTH):
-                    dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag="xaxis_pwm")
-                    y_axis = dpg.add_plot_axis(dpg.mvYAxis, label="PWM")
-                    pwm_series = dpg.add_line_series(time_buffer, data_buffer['pwm'], label="PWM Data", parent=y_axis)
-                    dpg.bind_item_theme(pwm_series, "pwm_theme")
+    # Second Row: Angular Velocity Plot (left) and Gains sliders (right)
+    with dpg.group(horizontal=True):
+        # Angular Velocity Plot (Bottom Left)
+        with dpg.plot(label="Angular Velocity Plot", height=PLOT_HEIGHT, width=PLOT_WIDTH):
+            x_axis = dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)", tag="xaxis_gyro")
+            y_axis = dpg.add_plot_axis(dpg.mvYAxis, label="GyroX", tag="yaxis_gyro")
+            
+            gyro_x_series = dpg.add_line_series(time_buffer, data_buffer['gyroX'], label="GyroX", parent=y_axis)
+            dpg.bind_item_theme(gyro_x_series, "gyro_x_theme")
 
-        # Group for sliders and number inputs (Balancing Controller and Following Controller)
-        with dpg.group(horizontal=True):
-            # Balancing Controller Inputs and Sliders
-            with dpg.group():
-                dpg.add_text("Kp: 0.00", tag="kp_label")
-                dpg.add_input_float(label="Kp Input", default_value=0, min_value=0, max_value=10, width=SLIDER_WIDTH, callback=update_kp)
-                dpg.add_slider_float(label="Kp", tag="kp_slider", default_value=0, min_value=0, max_value=10, width=SLIDER_WIDTH, callback=update_kp_slider)
-                
-                dpg.add_text("Kd: 0.00", tag="kd_label")
-                dpg.add_input_float(label="Kd Input", default_value=0, min_value=0, max_value=10, width=SLIDER_WIDTH, callback=update_kd)
-                dpg.add_slider_float(label="Kd", tag="kd_slider", default_value=0, min_value=0, max_value=10, width=SLIDER_WIDTH, callback=update_kd_slider)
-                
-                dpg.add_text("Ki: 0.00", tag="ki_label")
-                dpg.add_input_float(label="Ki Input", default_value=0, min_value=0, max_value=10, width=SLIDER_WIDTH, callback=update_ki)
-                dpg.add_slider_float(label="Ki", tag="ki_slider", default_value=0, min_value=0, max_value=10, width=SLIDER_WIDTH, callback=update_ki_slider)
-
-            # Spacer between Balancing and Following sliders
-            dpg.add_spacer(width=SPACING_BETWEEN_GROUPS)
-
-            # Following Controller Inputs and Sliders
-            with dpg.group():
-                dpg.add_text("Kp2: 0.00", tag="kp2_label")
-                dpg.add_input_float(label="Kp2 Input", default_value=0, min_value=0, max_value=10, width=SLIDER_WIDTH, callback=update_kp2)
-                dpg.add_slider_float(label="Kp2", tag="kp2_slider", default_value=0, min_value=0, max_value=10, width=SLIDER_WIDTH, callback=update_kp2_slider)
-                
-                dpg.add_text("Kd2: 0.00", tag="kd2_label")
-                dpg.add_input_float(label="Kd2 Input", default_value=0, min_value=0, max_value=10, width=SLIDER_WIDTH, callback=update_kd2)
-                dpg.add_slider_float(label="Kd2", tag="kd2_slider", default_value=0, min_value=0, max_value=10, width=SLIDER_WIDTH, callback=update_kd2_slider)
-                
-                dpg.add_text("Ki2: 0.00", tag="ki2_label")
-                dpg.add_input_float(label="Ki2 Input", default_value=0, min_value=0, max_value=10, width=SLIDER_WIDTH, callback=update_ki2)
-                dpg.add_slider_float(label="Ki2", tag="ki2_slider", default_value=0, min_value=0, max_value=10, width=SLIDER_WIDTH, callback=update_ki2_slider)
-
-        # Add the button for "Following Activated"
-        dpg.add_button(label="Following", tag="following_button", width=SLIDER_WIDTH)
+        # Gains Sliders (Bottom Right)
+        with dpg.group(horizontal=False):
+            dpg.add_text("Kp: 0.00", tag="kp_label")
+            dpg.add_input_float(label="Kp Input", default_value=0, min_value=0, max_value=10, width=SLIDER_WIDTH, callback=update_kp)
+            dpg.add_slider_float(label="Kp", tag="kp_slider", default_value=0, min_value=0, max_value=10, width=SLIDER_WIDTH, callback=update_kp_slider)
+            
+            dpg.add_text("Kd: 0.00", tag="kd_label")
+            dpg.add_input_float(label="Kd Input", default_value=0, min_value=0, max_value=10, width=SLIDER_WIDTH, callback=update_kd)
+            dpg.add_slider_float(label="Kd", tag="kd_slider", default_value=0, min_value=0, max_value=10, width=SLIDER_WIDTH, callback=update_kd_slider)
 
 # ---------------------------
 # Main Loop
@@ -239,7 +186,12 @@ try:
         current_time = time.time() - start_time
         mask = time_buffer >= max(0, current_time - 10)
 
-        # Update plots
+        # Dynamically adjust y-axis limits based on data in the buffer
+        dpg.set_axis_limits("yaxis_angle", np.min(data_buffer['anglex'][mask]), np.max(data_buffer['anglex'][mask]))  # For Angle Plot
+        dpg.set_axis_limits("yaxis_gyro", np.min(data_buffer['gyroX'][mask]), np.max(data_buffer['gyroX'][mask]))  # For GyroX Plot
+        dpg.set_axis_limits("yaxis_pwm", np.min(data_buffer['pwm'][mask]), np.max(data_buffer['pwm'][mask]))  # For PWM Plot
+
+        # Update plots with new data
         dpg.set_value(angle_series, [time_buffer[mask], data_buffer['anglex'][mask]])
         dpg.set_value(gyro_x_series, [time_buffer[mask], data_buffer['gyroX'][mask]])
         dpg.set_value(pwm_series, [time_buffer[mask], data_buffer['pwm'][mask]])
